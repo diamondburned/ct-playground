@@ -3,18 +3,21 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
+	"unicode"
 
-	"github.com/davecgh/go-spew/spew"
 	"github.com/pkg/errors"
 
 	ctclient "github.com/google/certificate-transparency-go/client"
 	"github.com/google/certificate-transparency-go/jsonclient"
 	"github.com/google/certificate-transparency-go/loglist3"
-	"github.com/google/certificate-transparency-go/x509"
 )
 
 func main() {
@@ -33,33 +36,73 @@ func main() {
 		loglist3.UsableLogStatus,
 	})
 
-	x509.Certificate
-
 	for _, operator := range logList.Operators {
 		log.Println("checking operator", operator.Name)
 		for _, ctlog := range operator.Logs {
 			log.Println("  checking log", ctlog.Description)
-			if err := printLog(ctx, ctlog); err != nil {
-				log.Print("cannot print ", ctlog.Description, ": ", err)
+			if err := writeLog(ctx, ctlog, "data/json"); err != nil {
+				log.Print("cannot write ", ctlog.Description, ": ", err)
 			}
-			return
 		}
 	}
 }
 
-func printLog(ctx context.Context, log *loglist3.Log) error {
+func writeLog(ctx context.Context, log *loglist3.Log, dstDir string) error {
 	client, err := ctclient.New(log.URL, http.DefaultClient, jsonclient.Options{})
 	if err != nil {
 		return errors.Wrap(err, "cannot make new CT client")
 	}
 
-	entries, err := client.GetEntries(ctx, 0, 1024)
-	if err != nil {
-		return errors.Wrap(err, "cannot get entries 0-1024")
+	const npages = 1
+	name := slugify(log.Description)
+
+	for i := 0; i < npages; i++ {
+		start := 1024 * i
+		end := 1024 * (i + 1)
+
+		entries, err := client.GetEntries(ctx, int64(start), int64(end))
+		if err != nil {
+			return errors.Wrap(err, "cannot get entries 0-1024")
+		}
+
+		dstPath := filepath.Join(dstDir, fmt.Sprintf("%s_%d-%d.json", name, start, end))
+		if err := writef(dstPath, func(w io.Writer) error {
+			enc := json.NewEncoder(w)
+			enc.SetIndent("", " ")
+			return enc.Encode(entries)
+		}); err != nil {
+			return errors.Wrapf(err, "failed to write to %s", dstPath)
+		}
 	}
 
-	spew.Fdump(os.Stdout, entries)
 	return nil
+}
+
+func writef(dst string, writeFunc func(io.Writer) error) error {
+	f, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if err := writeFunc(f); err != nil {
+		return err
+	}
+
+	if err := f.Close(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func slugify(str string) string {
+	return strings.Map(func(r rune) rune {
+		if !unicode.IsLetter(r) && !unicode.IsNumber(r) {
+			return -1
+		}
+		return r
+	}, str)
 }
 
 func fetchLogList(ctx context.Context) (loglist3.LogList, error) {
